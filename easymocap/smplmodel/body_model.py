@@ -2,12 +2,13 @@
   @ Date: 2020-11-18 14:04:10
   @ Author: Qing Shuai
   @ LastEditors: Qing Shuai
-  @ LastEditTime: 2021-05-27 20:35:10
-  @ FilePath: /EasyMocapRelease/easymocap/smplmodel/body_model.py
+  @ LastEditTime: 2021-08-28 16:37:55
+  @ FilePath: /EasyMocap/easymocap/smplmodel/body_model.py
 '''
 import torch
 import torch.nn as nn
-from .lbs import lbs, batch_rodrigues
+from .lbs import batch_rodrigues
+from .lbs import lbs, dqs
 import os.path as osp
 import pickle
 import numpy as np
@@ -39,54 +40,96 @@ def load_regressor(regressor_path):
         import ipdb; ipdb.set_trace()
     return X_regressor
 
+def load_bodydata(model_type, model_path, gender):
+    if osp.isdir(model_path):
+        model_fn = '{}_{}.{ext}'.format(model_type.upper(), gender.upper(), ext='pkl')
+        smpl_path = osp.join(model_path, model_fn)
+    else:
+        smpl_path = model_path
+    assert osp.exists(smpl_path), 'Path {} does not exist!'.format(
+        smpl_path)
+
+    with open(smpl_path, 'rb') as smpl_file:
+        data = pickle.load(smpl_file, encoding='latin1')
+    return data
+
 NUM_POSES = {'smpl': 72, 'smplh': 78, 'smplx': 66 + 12 + 9, 'mano': 9}
 NUM_SHAPES = 10
 NUM_EXPR = 10
 class SMPLlayer(nn.Module):
     def __init__(self, model_path, model_type='smpl', gender='neutral', device=None,
-        regressor_path=None) -> None:
+        regressor_path=None,
+        use_pose_blending=True, use_shape_blending=True, use_joints=True,
+        with_color=False, use_lbs=True,
+        **kwargs) -> None:
         super(SMPLlayer, self).__init__()
         dtype = torch.float32
         self.dtype = dtype
+        self.use_pose_blending = use_pose_blending
+        self.use_shape_blending = use_shape_blending
+        self.use_joints = use_joints
+        
+        if isinstance(device, str):
+            device = torch.device(device)
         self.device = device
         self.model_type = model_type
+        self.NUM_POSES = NUM_POSES[model_type]
         # create the SMPL model
-        if osp.isdir(model_path):
-            model_fn = 'SMPL_{}.{ext}'.format(gender.upper(), ext='pkl')
-            smpl_path = osp.join(model_path, model_fn)
+        if use_lbs:
+            self.lbs = lbs
         else:
-            smpl_path = model_path
-        assert osp.exists(smpl_path), 'Path {} does not exist!'.format(
-            smpl_path)
-
-        with open(smpl_path, 'rb') as smpl_file:
-            data = pickle.load(smpl_file, encoding='latin1')
+            self.lbs = dqs
+        data = load_bodydata(model_type, model_path, gender)
+        if with_color:
+            self.color = data['vertex_colors']
+        else:
+            self.color = None
         self.faces = data['f']
         self.register_buffer('faces_tensor',
                              to_tensor(to_np(self.faces, dtype=np.int64),
                                        dtype=torch.long))
-        # Pose blend shape basis: 6890 x 3 x 207, reshaped to 6890*3 x 207
-        num_pose_basis = data['posedirs'].shape[-1]
-        # 207 x 20670
-        posedirs = data['posedirs']
-        data['posedirs'] = np.reshape(data['posedirs'], [-1, num_pose_basis]).T
-        
-        for key in ['J_regressor', 'v_template', 'weights', 'posedirs', 'shapedirs']:
+        for key in ['J_regressor', 'v_template', 'weights']:
             val = to_tensor(to_np(data[key]), dtype=dtype)
             self.register_buffer(key, val)
+        # add poseblending
+        if use_pose_blending:
+            # Pose blend shape basis: 6890 x 3 x 207, reshaped to 6890*3 x 207
+            num_pose_basis = data['posedirs'].shape[-1]
+            # 207 x 20670
+            posedirs = data['posedirs']
+            data['posedirs'] = np.reshape(data['posedirs'], [-1, num_pose_basis]).T
+            val = to_tensor(to_np(data['posedirs']), dtype=dtype)
+            self.register_buffer('posedirs', val)
+        else:
+            self.posedirs = None
+        # add shape blending
+        if use_shape_blending:
+            val = to_tensor(to_np(data['shapedirs']), dtype=dtype)
+            self.register_buffer('shapedirs', val)
+        else:
+            self.shapedirs = None
+        if use_shape_blending:
+            self.J_shaped = None
+        else:
+            val = to_tensor(to_np(data['J']), dtype=dtype)
+            self.register_buffer('J_shaped', val)
+
+        self.nVertices = self.v_template.shape[0]
         # indices of parents for each joints
         parents = to_tensor(to_np(data['kintree_table'][0])).long()
         parents[0] = -1
         self.register_buffer('parents', parents)
-        if self.model_type == 'smplx':
-            # shape
-            self.num_expression_coeffs = 10
-            self.num_shapes = 10
-            self.shapedirs = self.shapedirs[:, :, :self.num_shapes+self.num_expression_coeffs]
-        elif self.model_type in ['smpl', 'smplh']:
-            self.shapedirs = self.shapedirs[:, :, :NUM_SHAPES]
+        
+        if self.use_shape_blending:
+            if self.model_type == 'smplx':
+                # shape
+                self.num_expression_coeffs = 10
+                self.num_shapes = 10
+                self.shapedirs = self.shapedirs[:, :, :self.num_shapes+self.num_expression_coeffs]
+            elif self.model_type in ['smpl', 'smplh']:
+                self.shapedirs = self.shapedirs[:, :, :NUM_SHAPES]
         # joints regressor
-        if regressor_path is not None:
+        if regressor_path is not None and use_joints:
             X_regressor = load_regressor(regressor_path)
             X_regressor = torch.cat((self.J_regressor, X_regressor), dim=0)
 
@@ -95,40 +138,50 @@ class SMPLlayer(nn.Module):
                 j_J_regressor[i, i] = 1
             j_v_template = X_regressor @ self.v_template
             # 
-            j_shapedirs = torch.einsum('vij,kv->kij', [self.shapedirs, X_regressor])
             # (25, 24)
             j_weights = X_regressor @ self.weights
-            j_posedirs = torch.einsum('ab, bde->ade', [X_regressor, torch.Tensor(posedirs)]).numpy()
-            j_posedirs = np.reshape(j_posedirs, [-1, num_pose_basis]).T
-            j_posedirs = to_tensor(j_posedirs)
-            self.register_buffer('j_posedirs', j_posedirs)
-            self.register_buffer('j_shapedirs', j_shapedirs)
+            if self.use_pose_blending:
+                j_posedirs = torch.einsum('ab, bde->ade', [X_regressor, torch.Tensor(posedirs)]).numpy()
+                j_posedirs = np.reshape(j_posedirs, [-1, num_pose_basis]).T
+                j_posedirs = to_tensor(j_posedirs)
+                self.register_buffer('j_posedirs', j_posedirs)
+            else:
+                self.j_posedirs = None
+            if self.use_shape_blending:
+                j_shapedirs = torch.einsum('vij,kv->kij', [self.shapedirs, X_regressor])
+                self.register_buffer('j_shapedirs', j_shapedirs)
+            else:
+                self.j_shapedirs = None
             self.register_buffer('j_weights', j_weights)
             self.register_buffer('j_v_template', j_v_template)
             self.register_buffer('j_J_regressor', j_J_regressor)
         if self.model_type == 'smplh':
             # load smplh data
-            self.num_pca_comps = 6
+            self.num_pca_comps = kwargs['num_pca_comps']
             from os.path import join
             for key in ['LEFT', 'RIGHT']:
-                left_file = join(os.path.dirname(smpl_path), 'MANO_{}.pkl'.format(key))
+                left_file = join(kwargs['mano_path'], 'MANO_{}.pkl'.format(key))
                 with open(left_file, 'rb') as f:
                     data = pickle.load(f, encoding='latin1')
                 val = to_tensor(to_np(data['hands_mean'].reshape(1, -1)), dtype=dtype)
                 self.register_buffer('mHandsMean'+key[0], val)
                 val = to_tensor(to_np(data['hands_components'][:self.num_pca_comps, :]), dtype=dtype)
                 self.register_buffer('mHandsComponents'+key[0], val)
-            self.use_pca = True
-            self.use_flat_mean = True
-        elif self.model_type == 'mano':
-            # TODO:write this into config file
-            self.num_pca_comps = 12
-            self.use_pca = True
+            self.use_pca = kwargs['use_pca']
+            self.use_flat_mean = kwargs['use_flat_mean']
             if self.use_pca:
-                NUM_POSES['mano'] = self.num_pca_comps + 3
+                self.NUM_POSES = 66 + self.num_pca_comps * 2
             else:
-                NUM_POSES['mano'] = 45 + 3
-            self.use_flat_mean = True
+                self.NUM_POSES = 66 + 15 * 3 * 2
+        elif self.model_type == 'mano':
+            self.num_pca_comps = kwargs['num_pca_comps']
+            self.use_pca = kwargs['use_pca']
+            self.use_flat_mean = kwargs['use_flat_mean']
+            if self.use_pca:
+                self.NUM_POSES = self.num_pca_comps + 3
+            else:
+                self.NUM_POSES = 45 + 3
+
             val = to_tensor(to_np(data['hands_mean'].reshape(1, -1)), dtype=dtype)
             self.register_buffer('mHandsMean', val)
             val = to_tensor(to_np(data['hands_components'][:self.num_pca_comps, :]), dtype=dtype)
@@ -144,24 +197,27 @@ class SMPLlayer(nn.Module):
                 self.register_buffer('mHandsComponents'+key[0], val)
             self.use_pca = True
             self.use_flat_mean = True
+        self.to(self.device)
     
     @staticmethod
     def extend_hand(poses, use_pca, use_flat_mean, coeffs, mean):
         if use_pca:
             poses = poses @ coeffs
-        if use_flat_mean:
+        if not use_flat_mean:
             poses = poses + mean
         return poses
 
     def extend_pose(self, poses):
+        # skip SMPL or already extend
         if self.model_type not in ['smplh', 'smplx', 'mano']:
             return poses
-        elif self.model_type == 'smplh' and poses.shape[-1] == 156:
+        elif self.model_type == 'smplh' and poses.shape[-1] == 156 and self.use_flat_mean:
             return poses
-        elif self.model_type == 'smplx' and poses.shape[-1] == 165:
+        elif self.model_type == 'smplx' and poses.shape[-1] == 165 and self.use_flat_mean:
             return poses
-        elif self.model_type == 'mano' and poses.shape[-1] == 48:
+        elif self.model_type == 'mano' and poses.shape[-1] == 48 and self.use_flat_mean:
             return poses
+        # skip mano
         if self.model_type == 'mano':
             poses_hand = self.extend_hand(poses[..., 3:], self.use_pca, self.use_flat_mean,
                 self.mHandsComponents, self.mHandsMean)
@@ -178,7 +234,7 @@ class SMPLlayer(nn.Module):
         if self.use_pca:
             poses_lh = poses_lh @ self.mHandsComponentsL
             poses_rh = poses_rh @ self.mHandsComponentsR
-        if self.use_flat_mean:
+        if not self.use_flat_mean:
             poses_lh = poses_lh + self.mHandsMeanL
             poses_rh = poses_rh + self.mHandsMeanR
         if self.model_type == 'smplh':
@@ -245,7 +301,10 @@ class SMPLlayer(nn.Module):
         poses = self.extend_pose(poses)
         return poses.detach().cpu().numpy()
 
-    def forward(self, poses, shapes, Rh=None, Th=None, expression=None, return_verts=True, return_tensor=True, only_shape=False, **kwargs):
+    def forward(self, poses, shapes, Rh=None, Th=None, expression=None, 
+        v_template=None,
+        return_verts=True, return_tensor=True, return_smpl_joints=False, 
+        only_shape=False, pose2rot=True, **kwargs):
         """ Forward pass for SMPL model
 
         Args:
@@ -284,39 +343,52 @@ class SMPLlayer(nn.Module):
         if expression is not None and self.model_type == 'smplx':
             shapes = torch.cat([shapes, expression], dim=1)
         # process poses
-        poses = self.extend_pose(poses)
-        if return_verts:
-            vertices, joints = lbs(shapes, poses, self.v_template,
+        if pose2rot: # if given rotation matrix, no need for this
+            poses = self.extend_pose(poses)
+        if return_verts or not self.use_joints:
+            if v_template is None:
+                v_template = self.v_template
+            vertices, joints = self.lbs(shapes, poses, v_template,
                                 self.shapedirs, self.posedirs,
                                 self.J_regressor, self.parents,
-                                self.weights, pose2rot=True, dtype=self.dtype)
+                                self.weights, pose2rot=pose2rot, dtype=self.dtype,
+                                use_pose_blending=self.use_pose_blending, use_shape_blending=self.use_shape_blending, J_shaped=self.J_shaped)
+            if not self.use_joints and not return_verts:
+                vertices = joints
         else:
-            vertices, joints = lbs(shapes, poses, self.j_v_template,
+            vertices, joints = self.lbs(shapes, poses, self.j_v_template,
                                 self.j_shapedirs, self.j_posedirs,
                                 self.j_J_regressor, self.parents,
-                                self.j_weights, pose2rot=True, dtype=self.dtype, only_shape=only_shape)
-            vertices = vertices[:, self.J_regressor.shape[0]:, :]
+                                self.j_weights, pose2rot=pose2rot, dtype=self.dtype, only_shape=only_shape,
+                                use_pose_blending=self.use_pose_blending, use_shape_blending=self.use_shape_blending, J_shaped=self.J_shaped)
+            if return_smpl_joints:
+                vertices = vertices[:, :self.J_regressor.shape[0], :]
+            else:
+                vertices = vertices[:, self.J_regressor.shape[0]:, :]
         vertices = torch.matmul(vertices, rot.transpose(1, 2)) + transl
         if not return_tensor:
             vertices = vertices.detach().cpu().numpy()
         return vertices
     
-    def init_params(self, nFrames):
+    def init_params(self, nFrames=1, nShapes=1, ret_tensor=False):
         params = {
-            'poses': np.zeros((nFrames, NUM_POSES[self.model_type])),
-            'shapes': np.zeros((1, NUM_SHAPES)),
+            'poses': np.zeros((nFrames, self.NUM_POSES)),
+            'shapes': np.zeros((nShapes, NUM_SHAPES)),
             'Rh': np.zeros((nFrames, 3)),
             'Th': np.zeros((nFrames, 3)),
         }
         if self.model_type == 'smplx':
             params['expression'] = np.zeros((nFrames, NUM_EXPR))
+        if ret_tensor:
+            for key in params.keys():
+                params[key] = to_tensor(params[key], self.dtype, self.device)
         return params
 
     def check_params(self, body_params):
         model_type = self.model_type
         nFrames = body_params['poses'].shape[0]
-        if body_params['poses'].shape[1] != NUM_POSES[model_type]:
-            body_params['poses'] = np.hstack((body_params['poses'], np.zeros((nFrames, NUM_POSES[model_type] - body_params['poses'].shape[1]))))
+        if body_params['poses'].shape[1] != self.NUM_POSES:
+            body_params['poses'] = np.hstack((body_params['poses'], np.zeros((nFrames, self.NUM_POSES - body_params['poses'].shape[1]))))
         if model_type == 'smplx' and 'expression' not in body_params.keys():
             body_params['expression'] = np.zeros((nFrames, NUM_EXPR))
         return body_params
@@ -329,4 +401,22 @@ class SMPLlayer(nn.Module):
                 output[key] = np.vstack([v[key] for v in param_list])
         if share_shape:
             output['shapes'] = output['shapes'].mean(axis=0, keepdims=True)
+        # add other keys
+        for key in param_list[0].keys():
+            if key in output.keys():
+                continue
+            output[key] = np.stack([v[key] for v in param_list])
+        return output
+    
+    @staticmethod
+    def select_nf(params_all, nf):
+        output = {}
+        for key in ['poses', 'Rh', 'Th']:
+            output[key] = params_all[key][nf:nf+1, :]
+        if 'expression' in params_all.keys():
+            output['expression'] = params_all['expression'][nf:nf+1, :]
+        if params_all['shapes'].shape[0] == 1:
+            output['shapes'] = params_all['shapes']
+        else:
+            output['shapes'] = params_all['shapes'][nf:nf+1, :]
         return output
